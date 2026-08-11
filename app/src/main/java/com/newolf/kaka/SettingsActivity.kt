@@ -1,6 +1,7 @@
 package com.newolf.kaka
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.ComponentName
@@ -250,6 +251,7 @@ class SettingsActivity : ComponentActivity() {
     }
 
     /** 消费 [PendingShare]，若有内容则立刻把图片交给 QQ 分享。 */
+    @SuppressLint("WrongConstant")
     private fun maybeForwardPendingShareToQQ() {
         val path = PendingShare.consume() ?: return
         val file = java.io.File(path)
@@ -264,7 +266,8 @@ class SettingsActivity : ComponentActivity() {
             val send = Intent(Intent.ACTION_SEND).apply {
                 type = "image/jpeg"
                 putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+//                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED or Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY)
+                addFlags(0x18000001 or Intent.FLAG_ACTIVITY_NO_HISTORY)
                 component = android.content.ComponentName(
                     "com.tencent.mobileqq",
                     "com.tencent.mobileqq.activity.JumpActivity"
@@ -286,6 +289,7 @@ class SettingsActivity : ComponentActivity() {
      * 通过 FileProvider 生成 URI，以 ACTION_SEND 直连 QQ 的 JumpActivity。
      * 目录归应用私有，无需运行时权限。
      */
+    @SuppressLint("WrongConstant")
     private fun onTestSendLatestImageClick() {
         val file = LatestImageFinder.findLatestScreenshot(this)
         if (file == null || !file.exists()) {
@@ -299,8 +303,7 @@ class SettingsActivity : ComponentActivity() {
             val send = Intent(Intent.ACTION_SEND).apply {
                 type = "image/jpeg"
                 putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION and Intent.FLAG_ACTIVITY_NEW_TASK and
-                        Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                addFlags(0x18000001 or Intent.FLAG_ACTIVITY_NO_HISTORY)
 
                 component = ComponentName(
                     "com.tencent.mobileqq",

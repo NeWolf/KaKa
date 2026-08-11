@@ -751,6 +751,98 @@ class PunchTaskExecutor(
         }
     }
 
+    /**
+     * QQ 分享面板兜底：找不到 targetChat 时，点击"最近转发"分区下方的第一个头像。
+     *
+     * 布局参考（用户截图）：分享面板从上到下是「取消/选择聊天/多选」→「搜索」→
+     * 「最近转发」（横向头像栏，第一个头像=最近转发对象）→「最近聊天」（纵向列表）。
+     *
+     * 实现策略（简单直接）：
+     *   accessibility 上报的头像 bounds 在实际 QQ 版本里位置飘忽（RecyclerView 复用问题）、
+     *   而且头像本身多为 clickable=false、父链 tile 面积不稳，导致 tap 命中率差。
+     *   用户实测在本机（1440×3007）"最近转发"首个头像可点区域约 x=50~282, y=715~1060，
+     *   中心 (166, 887) 稳定命中。这里按屏幕**百分比**换算硬编码，主流分辨率上都能覆盖：
+     *     - x: 8% (166/1440 ≈ 0.115  略偏保守取 0.115)
+     *     - y: 29.5% (887/3007 ≈ 0.295)
+     *
+     * 若后续遇到新机型或 QQ 布局大改导致偏离，可回退到基于"最近转发"标签 bounds 的动态推算。
+     */
+    private suspend fun tryTapFirstRecentForward(): Boolean {
+        val dm = service.resources.displayMetrics
+        val sw = dm.widthPixels
+        val sh = dm.heightPixels
+        // 参考坐标 (166, 887) on 1440×3007 → 百分比 (0.115, 0.295)
+        val fx = sw * 0.115f
+        val fy = sh * 0.295f
+        Logger.i(
+            TAG,
+            "点击'最近转发'第一个（固定坐标）tap#1($fx,$fy) duration=150 screen=${sw}x${sh}"
+        )
+        tapAt(fx, fy, durationMs = 150)
+        // QQ 头像 tile 对过短手势会丢弃；等 1s 观察是否离开"选择聊天"页。
+        // 判定标准：只要 root 里还能找到 desc="选择聊天" 就说明没进入会话。
+        delay(1000)
+        val stillOnPicker = try {
+            val root = service.rootInActiveWindow
+            root?.let {
+                val descHits = mutableListOf<AccessibilityNodeInfo>()
+                collectNodesByDesc(it, setOf("选择聊天"), descHits)
+                descHits.any { n -> n.isVisibleToUser }
+            } ?: false
+        } catch (_: Throwable) { false }
+        if (stillOnPicker) {
+            Logger.d(TAG, "'最近转发'首次 tap 后仍在'选择聊天'页，二次 tap 兜底 duration=250")
+            // 二次 tap：更长时长 + 略微下移 8px（避开头像圆边缘缺陷）
+            tapAt(fx, fy + 8f, durationMs = 250)
+        }
+        return true
+    }
+
+    /** 递归收集 root 子树中 bounds 完全落在 [top, bottom]（屏幕 y）竖带内、可视、非根级容器的节点。 */
+    private fun collectVisibleNodesInBand(
+        node: AccessibilityNodeInfo?,
+        top: Int,
+        bottom: Int,
+        screenW: Int,
+        out: MutableList<AccessibilityNodeInfo>,
+    ) {
+        if (node == null) return
+        try {
+            if (node.isVisibleToUser) {
+                val r = Rect().also { node.getBoundsInScreen(it) }
+                if (r.width() > 0 && r.height() > 0 &&
+                    r.top >= top && r.bottom <= bottom &&
+                    r.width() < screenW  // 排除满屏容器
+                ) {
+                    out.add(node)
+                }
+            }
+        } catch (_: Throwable) { /* ignore */ }
+        for (i in 0 until node.childCount) {
+            collectVisibleNodesInBand(node.getChild(i), top, bottom, screenW, out)
+        }
+    }
+
+    /**
+     * 递归遍历 root 子树，把 `contentDescription` **精确等于** wantedDescs 里任意值的节点收集到 out。
+     * 用途：QQ 底部"发送给 X"确认弹窗里的蓝色"发送"按钮通常是自绘 View，
+     * text=null 只有 desc="发送"，仅靠 findAccessibilityNodeInfosByText 会漏掉。
+     */
+    private fun collectNodesByDesc(
+        node: AccessibilityNodeInfo?,
+        wantedDescs: Set<String>,
+        out: MutableList<AccessibilityNodeInfo>,
+    ) {
+        if (node == null) return
+        try {
+            val d = node.contentDescription?.toString()
+            if (d != null && d in wantedDescs) out.add(node)
+        } catch (_: Throwable) { /* ignore */ }
+        for (i in 0 until node.childCount) {
+            collectNodesByDesc(node.getChild(i), wantedDescs, out)
+        }
+    }
+
     /** 尝试用文本点击，失败返回 false（不抛异常）。 */
     private suspend fun tryClickByText(texts: List<String>, timeout: Long): Boolean {
         val node = waitForNode(timeout) { root -> findClickableByTexts(root, texts) }
@@ -1261,6 +1353,48 @@ class PunchTaskExecutor(
             depth++
         }
         return null
+    }
+
+    /**
+     * 向上找最"像 tile 容器"的祖先节点：面积至少是自己的 1.2 倍、且宽度仍然小于屏幕宽度。
+     * 用途：QQ 分享面板"最近转发"里头像节点本身只是圆图（129×203），
+     * 但真正对点击生效的目标是包含头像 + 下方昵称文字的整个 tile（约 230×280）。
+     * tap tile 中心比 tap 头像中心更容易触发 QQ 的 item click。
+     *
+     * 找不到合适祖先时返回自己。
+     */
+    private fun tileContainerOrSelf(
+        node: AccessibilityNodeInfo,
+        screenW: Int,
+    ): AccessibilityNodeInfo {
+        val selfRect = Rect().also { node.getBoundsInScreen(it) }
+        val selfArea = selfRect.width().toLong() * selfRect.height()
+        var cur: AccessibilityNodeInfo? = node.parent
+        var best: AccessibilityNodeInfo = node
+        var bestArea = selfArea
+        var depth = 0
+        while (cur != null && depth < 6) {
+            val r = Rect().also { cur!!.getBoundsInScreen(it) }
+            val a = r.width().toLong() * r.height()
+            // 硬约束：祖先 bounds 必须**完全包含** node bounds。
+            // 否则 QQ ListView/RecyclerView 复用等场景下，parent 汇报的 bounds 可能来自
+            // 缓存里"下一行的容器"（bounds y 甚至比 node y 还大），导致 tap 到列表其它行。
+            val contains = r.left <= selfRect.left && r.top <= selfRect.top &&
+                r.right >= selfRect.right && r.bottom >= selfRect.bottom
+            if (contains &&
+                r.width() in 1..(screenW - 1) &&
+                a >= selfArea * 12 / 10 &&    // 至少 1.2 倍面积（含昵称）
+                a <= selfArea * 5              // 但不超过自身 5 倍（避免跳到整个头像栏容器）
+            ) {
+                if (a > bestArea) {
+                    best = cur!!
+                    bestArea = a
+                }
+            }
+            cur = cur.parent
+            depth++
+        }
+        return best
     }
 
     /**
@@ -1822,34 +1956,115 @@ class PunchTaskExecutor(
                     }
                     Logger.d(TAG, "步骤 3.2 候选(${hits.size}): $summary")
                 }
-                // 命中判定：text 严格== 或 desc 以 "targetChat," / "targetChat " 开头
-                // 之所以要求分隔符（逗号/空格），是避免 "L" 命中 "Linus, ..." 这类前缀撞名。
-                val descPrefixes = listOf("$targetChat,", "$targetChat ")
-                hits.firstOrNull { n ->
-                    if (!n.isVisibleToUser) return@firstOrNull false
+                // 命中判定：
+                //  - text 严格 == targetChat，或
+                //  - desc 严格 == targetChat（例如"最近聊天"横向头像栏，desc 仅昵称）
+                //  - desc 以 "targetChat + 分隔符" 开头（QQ 语义化拼接："NeWolf, ,3条未读,..."；
+                //    QQ 会同时使用半角"," 和全角"，"，且"当前聊天"提示条常见）
+                //  分隔符是关键——避免 "L" 命中 "Linus, ..." 这类前缀撞名。
+                //
+                // 关键教训：QQ 分享面板里联系人行、"当前聊天"提示条大多 clickable=false，
+                // 只有顶层 FrameLayout 是根级 clickable=true（我们不能点根）。因此这里**不**再要求
+                // 节点本身或祖先 clickable=true，命中后统一交给下面的坐标 tap 兜底点击。
+                val descPrefixes = listOf(
+                    "$targetChat,",   // 半角逗号
+                    "$targetChat，",  // 全角逗号
+                    "$targetChat "    // 空格
+                )
+                val strict = hits.filter { n ->
+                    if (!n.isVisibleToUser) return@filter false
                     val nText = n.text?.toString()
                     val nDesc = n.contentDescription?.toString()
                     val textMatch = nText == targetChat
-                    val descMatch = nDesc != null && descPrefixes.any { nDesc.startsWith(it) }
-                    (textMatch || descMatch) &&
-                        (firstClickableAncestor(n) != null)
+                    val descMatch = nDesc != null &&
+                        (nDesc == targetChat || descPrefixes.any { nDesc.startsWith(it) })
+                    textMatch || descMatch
                 }
+                // 挑选优先级（关键：desc 含"当前聊天"的候选**不能**当作 targetChat 命中——
+                // 它是 QQ 分享面板的"继续发送到上一次分享的会话"提示条，恰好可能显示目标昵称，
+                // 但点它不保证发到 targetChat；真正的联系人 tile 是"最近聊天"横向头像栏里的
+                // 头像块 / 联系人列表行）：
+                //  a) 排除"当前聊天"后，**取 top 最小的**（视觉上最靠上的）候选。
+                //     QQ 分享面板从上到下的分区顺序固定：搜索栏 → 最近转发（横向头像栏）→
+                //     最近聊天列表 → 联系人列表。**"最近转发"里有就直接点它**，不要再去下面的
+                //     列表里挑——列表里的行常常是 744×6 之类的空 label / 折叠节点，tap 中心点不到
+                //     有效 UI。同时**明确不要求 clickable=true**——QQ 分享面板里几乎所有 item 的
+                //     clickable 都是 false（真正的点击响应挂在根级 FrameLayout 上），强行要求
+                //     clickable 反而会漏命中；命中后统一交给下游的坐标 tap 兜底。
+                //  b) 兜底：仍找不到时才允许"当前聊天"提示条（等价于"发到最近一次的会话"）。
+                val nonCurrent = strict.filter { n ->
+                    val d = n.contentDescription?.toString().orEmpty()
+                    !d.contains("当前聊天")
+                }                // **不要求 clickable=true**：QQ 分享面板里几乎所有 item 的 clickable 都是 false
+                // （点击响应挂在根级 FrameLayout 上），强行要求 clickable 会漏命中；命中后交给下游 tap 兜底。
+                // **取 top 最小的**（视觉上最靠上的）候选——QQ 分享面板从上到下固定是：
+                // 搜索栏 → 最近转发（横向头像栏）→ 最近聊天列表 → 联系人列表。
+                // "最近转发"里有就直接用它，不再去下面的列表里挑（列表里的候选常常是 744×6 之类
+                // 的空 label / 折叠节点，tap 中心点不到有效 UI）。
+                val dm = service.resources.displayMetrics
+                val sw = dm.widthPixels
+                val sh = dm.heightPixels
+                nonCurrent.filter { n ->
+                    val r = Rect().also { n.getBoundsInScreen(it) }
+                    r.width() > 0 && r.height() > 0 &&
+                        r.left >= 0 && r.top >= 0 &&
+                        r.right <= sw && r.bottom <= sh &&
+                        r.width() < sw
+                }.minByOrNull { n ->
+                    val r = Rect().also { n.getBoundsInScreen(it) }
+                    r.top
+                }
+                    ?: strict.firstOrNull { n ->
+                        val d = n.contentDescription?.toString().orEmpty()
+                        d.contains("当前聊天")
+                    }
             }
             if (chatNode == null) {
                 dumpTopWindow(prefixTag = "chat-node-not-found")
-                Logger.w(TAG, "在 QQ 分享面板未找到目标：$targetChat；请手动完成发送")
-                return
+                Logger.w(TAG, "在 QQ 分享面板未找到目标：$targetChat；尝试兜底点击'最近转发'第一个")
+                // 兜底：找"最近转发"标题节点，取其正下方最近的一个可视节点当作第一个头像 tap。
+                // "最近转发"是 QQ 分享面板顶部横向栏的分区标题（见截图），下面第一个头像即最近一次转发对象。
+                val fallbackOk = tryTapFirstRecentForward()
+                if (!fallbackOk) {
+                    Logger.w(TAG, "'最近转发'兜底也未命中；请手动完成发送")
+                    return
+                }
+                // 兜底后同样等 QQ 弹出发送确认
+                delay(1800)
+                // 继续走 3.3 找发送按钮
+            } else {
+                val chatBounds = Rect().also { chatNode.getBoundsInScreen(it) }
+                // **忽略 clickable=false，直接坐标 tap chatBounds 中心**。
+                // 教训：QQ 分享面板里几乎所有联系人 item 的 clickable 都是 false（点击响应挂在
+                // 根级 FrameLayout 上），先试 performClick 只会浪费一次调用还得等回调；直接按
+                // chatBounds 中心坐标 tap 才是通用解。chatBounds 是无障碍树里当前实际命中节点
+                // 的位置，比任何硬编码坐标都稳。
+                if (chatBounds.width() > 0 && chatBounds.height() > 0) {
+                    val cx = chatBounds.exactCenterX()
+                    val cy = chatBounds.exactCenterY()
+                    Logger.i(TAG, "点击联系人 target=$targetChat bounds=$chatBounds 坐标 tap ($cx,$cy) duration=150")
+                    tapAt(cx, cy, durationMs = 150)
+                    // 二次兜底：若 1s 后仍在"选择聊天"页（QQ 忽略了首次 tap，例如小头像点太短），
+                    // 换一个稍长的 duration 再点一次同一坐标。
+                    delay(1000)
+                    val stillOnPicker = try {
+                        val r = service.rootInActiveWindow
+                        r?.let {
+                            val d = mutableListOf<AccessibilityNodeInfo>()
+                            collectNodesByDesc(it, setOf("选择聊天"), d)
+                            d.any { n -> n.isVisibleToUser }
+                        } ?: false
+                    } catch (_: Throwable) { false }
+                    if (stillOnPicker) {
+                        Logger.d(TAG, "首次 tap 后仍在'选择聊天'页，二次 tap 兜底 ($cx,$cy) duration=250")
+                        tapAt(cx, cy, durationMs = 250)
+                    }
+                } else {
+                    Logger.w(TAG, "点击联系人：chatBounds 无效 $chatBounds，跳过 tap")
+                }
+                // 等 QQ 弹出"发送给 X？"的确认弹窗。pad 上动画+异步渲染更慢，1800ms 更稳。
+                delay(1800)
             }
-            val chatBounds = Rect().also { chatNode.getBoundsInScreen(it) }
-            val clickable = if (chatNode.isClickable) chatNode else firstClickableAncestor(chatNode)
-            val chatClickOk = clickable?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
-            Logger.i(TAG, "点击联系人 target=$targetChat bounds=$chatBounds performClick=$chatClickOk")
-            if (!chatClickOk && chatBounds.width() > 0 && chatBounds.height() > 0) {
-                Logger.d(TAG, "点击联系人失败，坐标 tap 兜底 $chatBounds")
-                tapAt(chatBounds.exactCenterX(), chatBounds.exactCenterY())
-            }
-            // 等 QQ 弹出"发送给 X？"的确认弹窗。pad 上动画+异步渲染更慢，1800ms 更稳。
-            delay(1800)
 
             // 3.3 找发送按钮：只接受 text 精确等于"发送"或"确定"；**不再接受单字"发"**，
             //     否则会命中"发红包/发消息"等无关按钮，把 QQ 状态搞乱。
@@ -1861,14 +2076,19 @@ class PunchTaskExecutor(
             val screenH = dm.heightPixels
             val confirmBtn = waitForNode(6000) { root ->
                 val allHits = mutableListOf<AccessibilityNodeInfo>()
+                // 1) 按 text 精确等于"发送"/"确定"搜（走 QQ 内部 findByText 索引）
                 for (t in listOf("发送", "确定")) {
                     val hits = try { root.findAccessibilityNodeInfosByText(t) } catch (_: Throwable) { null }
                     if (hits != null) allHits.addAll(hits.filter { it.text?.toString() == t })
                 }
+                // 2) 递归遍历整树，按 contentDescription 精确等于"发送"/"确定"补充候选。
+                //    原因：QQ 底部"发送给 X"确认弹窗里的蓝色"发送"按钮多为自绘 View，text=null，
+                //    只有 desc="发送"；只用 findByText 会全部漏掉，导致 waitForNode 6s 超时。
+                collectNodesByDesc(root, setOf("发送", "确定"), allHits)
                 if (allHits.isNotEmpty()) {
                     val summary = allHits.take(8).joinToString(" | ") { n ->
                         val r = Rect().also { n.getBoundsInScreen(it) }
-                        "text='${n.text}' visible=${n.isVisibleToUser} clickable=${n.isClickable} bounds=$r"
+                        "text='${n.text}' desc='${n.contentDescription}' visible=${n.isVisibleToUser} clickable=${n.isClickable} bounds=$r"
                     }
                     Logger.d(TAG, "3.3 '发送/确定'候选(${allHits.size}): $summary screen=${screenW}x${screenH}")
                 }
@@ -1878,8 +2098,7 @@ class PunchTaskExecutor(
                     val onScreen = r.width() > 0 && r.height() > 0 &&
                         r.left >= 0 && r.top >= 0 &&
                         r.right <= screenW && r.bottom <= screenH
-                    onScreen && n.isVisibleToUser &&
-                        (n.isClickable || firstClickableAncestor(n) != null)
+                    onScreen && n.isVisibleToUser
                 }
             }
             if (confirmBtn == null) {
@@ -1955,9 +2174,29 @@ class PunchTaskExecutor(
                 delay(800)
             }
         } finally {
-            // 无论成功/失败，都把前台退回桌面，避免残留在 QQ 上打扰用户
-            Logger.d(TAG, "replyWithQQ 收尾：返回桌面")
-//            service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+            // 无论成功/失败，都把前台退回桌面，避免残留在 QQ 上打扰用户；
+            // 若支持则再触发一次锁屏（API 28+ GLOBAL_ACTION_LOCK_SCREEN），恢复到"待机"状态。
+            Logger.d(TAG, "replyWithQQ 收尾：返回桌面 + 尝试息屏")
+            val homeOk = try {
+                service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+            } catch (t: Throwable) {
+                Logger.w(TAG, "GLOBAL_ACTION_HOME 失败: ${t.message}")
+                false
+            }
+            Logger.d(TAG, "收尾: HOME ok=$homeOk")
+            // 息屏之前给一小段停留，避免动画未落完就锁屏
+            delay(500)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val lockOk = try {
+                    service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN)
+                } catch (t: Throwable) {
+                    Logger.w(TAG, "GLOBAL_ACTION_LOCK_SCREEN 失败: ${t.message}")
+                    false
+                }
+                Logger.d(TAG, "收尾: LOCK_SCREEN ok=$lockOk")
+            } else {
+                Logger.d(TAG, "收尾: 当前 API<28 不支持 GLOBAL_ACTION_LOCK_SCREEN，跳过息屏")
+            }
         }
     }
 

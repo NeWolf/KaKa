@@ -1,5 +1,6 @@
 package com.newolf.kaka
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.KeyguardManager
 import android.content.Intent
@@ -139,6 +140,7 @@ class RelayLaunchActivity : Activity() {
         Logger.i(TAG, "已启动 QQ")
     }
 
+    @SuppressLint("WrongConstant")
     private fun sendImageToQQ(imageFile: File) {
         if (!imageFile.exists()) {
             Logger.e(TAG, "图片文件不存在: ${imageFile.absolutePath}")
@@ -158,13 +160,14 @@ class RelayLaunchActivity : Activity() {
                 QQ_PACKAGE,
                 "com.tencent.mobileqq.activity.JumpActivity"
             )
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION and Intent.FLAG_ACTIVITY_NEW_TASK and
-                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+//            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK or
+//                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED )
+            addFlags(0x18000001 or Intent.FLAG_ACTIVITY_NO_HISTORY)
             setPackage(QQ_PACKAGE)
         }
         try {
             startActivity(send)
-            Logger.i(TAG, "已触发 QQ 图片分享 uri=$uri")
+            Logger.i(TAG, "已触发 QQ 图片分享 uri=$uri,send = $send")
         } catch (t: Throwable) {
             Logger.e(TAG, "startActivity(SEND) 失败: ${t.message}", t)
         }
