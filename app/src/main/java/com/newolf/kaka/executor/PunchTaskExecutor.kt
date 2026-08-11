@@ -1832,7 +1832,7 @@ class PunchTaskExecutor(
                     val textMatch = nText == targetChat
                     val descMatch = nDesc != null && descPrefixes.any { nDesc.startsWith(it) }
                     (textMatch || descMatch) &&
-                        (n.isClickable || firstClickableAncestor(n) != null)
+                        (firstClickableAncestor(n) != null)
                 }
             }
             if (chatNode == null) {

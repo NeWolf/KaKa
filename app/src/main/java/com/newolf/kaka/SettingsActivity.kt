@@ -48,6 +48,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.newolf.kaka.model.PunchTypeMapper
 import com.newolf.kaka.ui.theme.KaKaTheme
+import com.newolf.kaka.util.LatestImageFinder
+import com.newolf.kaka.util.Logger
 import com.tencent.mmkv.MMKV
 
 class SettingsActivity : ComponentActivity() {
@@ -88,6 +90,7 @@ class SettingsActivity : ComponentActivity() {
                         onOpenAccessibilitySettings = ::openAccessibilitySettings,
                         onOpenOverlayPermission = ::openOverlayPermission,
                         onRequestNotificationPermission = ::requestNotificationPermission,
+                        onTestSendLatestImage = ::onTestSendLatestImageClick,
                     )
                 }
             }
@@ -274,6 +277,47 @@ class SettingsActivity : ComponentActivity() {
             com.newolf.kaka.util.Logger.e("Settings", "转发 QQ 分享失败: ${t.message}", t)
         }
     }
+
+    // ================= 测试：发送本地截图目录里的最后一张图片给 QQ =================
+
+    /**
+     * 首页"测试发送图片"按钮入口：
+     * 读取本应用截图目录（`getExternalFilesDir(null)/screenshots/`）里最新的 .jpg 文件，
+     * 通过 FileProvider 生成 URI，以 ACTION_SEND 直连 QQ 的 JumpActivity。
+     * 目录归应用私有，无需运行时权限。
+     */
+    private fun onTestSendLatestImageClick() {
+        val file = LatestImageFinder.findLatestScreenshot(this)
+        if (file == null || !file.exists()) {
+            Toast.makeText(this, "截图目录里没有找到图片", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this, "${packageName}.fileprovider", file
+            )
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "image/jpeg"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION and Intent.FLAG_ACTIVITY_NEW_TASK and
+                        Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+
+                component = ComponentName(
+                    "com.tencent.mobileqq",
+                    "com.tencent.mobileqq.activity.JumpActivity"
+                )
+                setPackage("com.tencent.mobileqq")
+            }
+            startActivity(send)
+            Toast.makeText(this, "已触发 QQ 分享: ${file.name}", Toast.LENGTH_SHORT).show()
+            Logger.i(
+                "Settings", "测试发送最后一张截图 file=${file.absolutePath} uri=$uri, send = $send"
+            )
+        } catch (t: Throwable) {
+            Toast.makeText(this, "拉起 QQ 失败：${t.message}", Toast.LENGTH_LONG).show()
+            Logger.e("Settings", "测试发送图片失败: ${t.message}", t)
+        }
+    }
 }
 
 private val PUNCH_TYPES = PunchTypeMapper.displayOptions
@@ -292,6 +336,7 @@ fun SettingsScreen(
     onOpenAccessibilitySettings: () -> Unit,
     onOpenOverlayPermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
+    onTestSendLatestImage: () -> Unit,
 ) {
     val context = LocalContext.current
     val mmkv = remember { MMKV.defaultMMKV() }
@@ -473,6 +518,10 @@ fun SettingsScreen(
 
         Button(onClick = onRequestNotificationPermission, modifier = Modifier.fillMaxWidth()) {
             Text("申请通知权限")
+        }
+
+        Button(onClick = onTestSendLatestImage, modifier = Modifier.fillMaxWidth()) {
+            Text("测试：发送最后一张图片到 QQ")
         }
     }
 }

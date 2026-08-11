@@ -158,7 +158,8 @@ class RelayLaunchActivity : Activity() {
                 QQ_PACKAGE,
                 "com.tencent.mobileqq.activity.JumpActivity"
             )
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION and Intent.FLAG_ACTIVITY_NEW_TASK and
+                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
             setPackage(QQ_PACKAGE)
         }
         try {
